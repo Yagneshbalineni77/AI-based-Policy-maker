@@ -1,0 +1,252 @@
+# ==============================================================================
+# FINAL INTEGRATED SCRIPT: SIMULATION ENGINE + GENETIC ALGORITHM
+# ==============================================================================
+
+# 1. INSTALL DEPENDENCIES
+# ------------------------------------------------------------------------------
+!pip install deap
+
+# 2. IMPORTS
+# ------------------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+import json
+import random
+from deap import base, creator, tools, algorithms
+
+print("--- Final Integrated Model: Simulation Engine + Genetic Algorithm ---")
+
+# 3. FILE PATHS & CONFIGURATION
+# ------------------------------------------------------------------------------
+AGENT_FILE = '/kaggle/input/dataset3/agents_fully_corrected.csv'
+RULEBOOK_FILE = '/kaggle/input/dataset3/simulation_rulebook.csv'
+GA_POPULATION_SIZE = 100
+GA_NUM_GENERATIONS = 30   # Increase later for stronger results
+GA_CROSSOVER_PROB = 0.6
+GA_MUTATION_PROB = 0.2
+
+# ==============================================================================
+# PART 2: THE SIMULATION ENGINE (THE "WORKER")
+# ==============================================================================
+
+class HouseholdAgent:
+    """Represents a single household in the simulation."""
+    def __init__(self, agent_data):
+        for key, value in agent_data.items():
+            setattr(self, key, value)
+        self.income = getattr(self, 'income', getattr(self, 'income (₹)', 0))
+        self.savings = self.income * 0.5
+        self.is_in_poverty = False
+        self.out_of_pocket_spend_total = 0
+        self.is_insured_by_policy = False
+
+    def decide_to_buy_insurance(self, policy_chromosome):
+        """Agent decides whether to buy the policy."""
+        willingness_to_pay = self.income * 0.02
+        if policy_chromosome['premium'] <= willingness_to_pay:
+            adoption_probability = self.Propensity_to_Buy_Score / 100.0
+            if np.random.rand() < adoption_probability:
+                self.is_insured_by_policy = True
+
+    def health_shock_event(self, rulebook, policy_chromosome, year):
+        """Simulates a health shock for the agent."""
+        if np.random.rand() < self.health_risk:
+            if np.random.rand() < rulebook['catastrophic_event_prob_%']:
+                medical_cost = rulebook['catastrophic_medical_cost']
+            else:
+                medical_cost = rulebook['base_medical_cost']
+            current_medical_cost = medical_cost * ((1 + rulebook['medical_inflation_rate_%']) ** year)
+
+            claimable_amount = min(current_medical_cost, policy_chromosome['sum_insured'])
+            out_of_pocket_cost = current_medical_cost
+
+            if self.is_insured_by_policy:
+                co_payment = claimable_amount * policy_chromosome['co_payment_percentage']
+                insurer_paid = claimable_amount - co_payment
+                out_of_pocket_cost = current_medical_cost - insurer_paid
+
+            self.savings -= out_of_pocket_cost
+            self.out_of_pocket_spend_total += out_of_pocket_cost
+
+            if self.savings < 0 or self.income < rulebook['poverty_line_annual_income']:
+                self.is_in_poverty = True
+
+
+class SimulationEnvironment:
+    """Manages the simulation for a single policy chromosome."""
+    def __init__(self, agent_df, rulebook_df):
+        self.rulebook = self._load_rulebook(rulebook_df)
+        self.initial_population_df = agent_df
+
+    def _load_rulebook(self, rulebook_df):
+        rb = rulebook_df.set_index('Rule Name')['Value for Prototype'].to_dict()
+        for key, value in rb.items():
+            try:
+                numeric_val = float(str(value).replace('%', ''))
+                if '%' in key:
+                    numeric_val /= 100
+                rb[key] = numeric_val
+            except (ValueError, TypeError):
+                continue
+        return rb
+
+    def run_simulation_for_policy(self, policy_chromosome):
+        """Runs the simulation for ONE specific policy."""
+        population = [HouseholdAgent(row.to_dict()) for _, row in self.initial_population_df.iterrows()]
+
+        for agent in population:
+            agent.decide_to_buy_insurance(policy_chromosome)
+
+        duration = int(self.rulebook['simulation_duration'])
+        for year in range(1, duration + 1):
+            for agent in population:
+                agent.health_shock_event(self.rulebook, policy_chromosome, year)
+
+        reach = sum(1 for agent in population if agent.is_insured_by_policy)
+        cost = sum(agent.out_of_pocket_spend_total for agent in population)
+        reach_in_shravasti = sum(
+            1 for agent in population if agent.is_insured_by_policy and agent.district == 'Shravasti'
+        )
+        equity_score = reach_in_shravasti / reach if reach > 0 else 0
+
+        return reach, cost, equity_score
+
+
+# ==============================================================================
+# PART 3: THE GENETIC ALGORITHM (THE "MANAGER")
+# ==============================================================================
+
+# 1. Define Fitness
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+# 2. Define Chromosome (Individual)
+creator.create("Individual", list, fitness=creator.FitnessMax)
+
+# 3. Toolbox
+toolbox = base.Toolbox()
+
+# --- Gene Generators ---
+toolbox.register("premium", random.randint, 300, 2500)
+toolbox.register("sum_insured", random.randint, 50000, 500000)
+toolbox.register("eligibility_threshold", random.uniform, 0.2, 0.8)
+toolbox.register("benefit_package", random.choice, ['Basic', 'Basic+Maternity', 'Comprehensive'])
+toolbox.register("co_payment_percentage", random.uniform, 0.0, 0.4)
+
+# --- Individual + Population ---
+toolbox.register("individual", tools.initCycle, creator.Individual, (
+    toolbox.premium, toolbox.sum_insured, toolbox.eligibility_threshold,
+    toolbox.benefit_package, toolbox.co_payment_percentage
+), n=1)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+
+def evaluate_policy(individual, simulation_env):
+    """Fitness Function: GA <-> Simulation."""
+    policy_chromosome = {
+        'premium': individual[0],
+        'sum_insured': individual[1],
+        'eligibility_threshold': individual[2],
+        'benefit_package': individual[3],
+        'co_payment_percentage': individual[4]
+    }
+
+    reach, cost, equity_score = simulation_env.run_simulation_for_policy(policy_chromosome)
+
+    w1_reach, w2_cost, w3_equity = 100, 0.0001, 5000
+    fitness_score = (w1_reach * reach) - (w2_cost * cost) + (w3_equity * equity_score)
+
+    return (fitness_score,)
+def custom_mutation(individual, indpb=0.2):
+    """Custom mutation for mixed-type individuals."""
+    if random.random() < indpb:
+        individual[0] = random.randint(300, 2500)  # premium
+    if random.random() < indpb:
+        individual[1] = random.randint(50000, 500000)  # sum_insured
+    if random.random() < indpb:
+        individual[2] = random.uniform(0.2, 0.8)  # eligibility_threshold
+    if random.random() < indpb:
+        individual[3] = random.choice(['Basic', 'Basic+Maternity', 'Comprehensive'])  # benefit_package
+    if random.random() < indpb:
+        individual[4] = random.uniform(0.0, 0.4)  # co_payment_percentage
+    return individual,
+
+
+
+# --- GA Operators ---
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", custom_mutation, indpb=0.2)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+if __name__ == "__main__":
+    try:
+        agent_df = pd.read_csv(AGENT_FILE)
+        rulebook_df = pd.read_csv(RULEBOOK_FILE)
+        print("✅ Successfully loaded Agent and Rulebook files.")
+
+        simulation_env = SimulationEnvironment(agent_df, rulebook_df)
+
+        toolbox.register("evaluate", evaluate_policy, simulation_env=simulation_env)
+
+        pop = toolbox.population(n=GA_POPULATION_SIZE)
+
+        print("\n--- 🚀 Starting Genetic Algorithm Evolution ---")
+        algorithms.eaSimple(pop, toolbox,
+                            cxpb=GA_CROSSOVER_PROB,
+                            mutpb=GA_MUTATION_PROB,
+                            ngen=GA_NUM_GENERATIONS,
+                            verbose=True)
+
+        print("\n--- ✅ Genetic Algorithm Finished ---")
+        best_individuals = tools.selBest(pop, k=GA_POPULATION_SIZE)
+
+        final_results = []
+        for ind in best_individuals:
+            reach, cost, equity = simulation_env.run_simulation_for_policy({
+                'premium': ind[0],
+                'sum_insured': ind[1],
+                'eligibility_threshold': ind[2],
+                'benefit_package': ind[3],
+                'co_payment_percentage': ind[4]
+            })
+            policy_dict = {
+                'premium': ind[0],
+                'sum_insured': ind[1],
+                'eligibility_threshold': ind[2],
+                'benefit_package': ind[3],
+                'co_payment_percentage': ind[4],
+                'fitness': ind.fitness.values[0],
+                'reach': reach,
+                'cost': cost,
+                'equity': equity
+            }
+            final_results.append(policy_dict)
+
+        final_best_policy = final_results[0]
+        budget_policy = min(final_results, key=lambda x: x['cost'])
+        balanced_policy = final_results[len(final_results) // 4]
+
+        print("\n🏆 Top 3 Evolved Policies:")
+        print("\n1. Max Reach Policy (Best Overall):")
+        print(json.dumps(final_best_policy, indent=4))
+
+        print("\n2. Budget Policy (Lowest Cost):")
+        print(json.dumps(budget_policy, indent=4))
+
+        print("\n3. Balanced Policy (Mix of Reach & Cost):")
+        print(json.dumps(balanced_policy, indent=4))
+
+        with open('final_ga_results.json', 'w') as f:
+            json.dump({
+                "max_reach_option": final_best_policy,
+                "budget_option": budget_policy,
+                "balanced_option": balanced_policy
+            }, f, indent=4)
+        print("\n💾 Results saved to 'final_ga_results.json'")
+
+    except FileNotFoundError:
+        print("❌ ERROR: Could not find input files.")
+    except Exception as e:
+        print(f"⚠️ Unexpected error: {e}")
